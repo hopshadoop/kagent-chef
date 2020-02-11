@@ -1,0 +1,222 @@
+#!/usr/bin/env bash
+
+
+# Details on how to securely pass parameter from agent.py to this script:
+# https://unix.stackexchange.com/questions/188536/how-to-make-a-temporary-file-in-ram
+
+function _help {
+    echo "Helper script to run zfs commands"
+    echo "Usage: $0 create|mount|status|rotate "
+}
+
+
+if [ $# -lt 1 ]
+then
+    _help
+    exit 2
+fi
+
+# parse kagent config.ini file for the value of zfs-key-file entry
+KEY_FILE=$(awk -F "=" '/zfs-key-file/ {print $2}' <%= node['kagent']['etc'] %>/config.ini | tr -d ' ')
+
+
+# datasets are in the format "file:///disks/hdfs/1,file:///disks/hdfs/2, ..."
+# No spaces allowed in this list of directories
+DN_DIRS=<%= node['hops']['dn']['data_dir'] %>
+RES=
+VOLUME=
+ZPOOLS=
+
+#trap "rm -f $KEY_FILE" EXIT
+
+trim() {
+    local var="$*"
+    # remove leading whitespace characters
+    var="${var#"${var%%[![:space:]]*}"}"
+    # remove trailing whitespace characters
+    var="${var%"${var##*[![:space:]]}"}"
+    echo -n "$var"
+}
+
+function _create {
+
+    IFS=',' read -r -a DIRS <<< "$DN_DIRS"
+    dn_len="${#DIRS[@]}"
+
+    # remove spaces from zpool list
+    zpools_clean=$(echo $ZPOOLS | tr -d ' ')
+    IFS=',' read -r -a POOLS <<< "$zpools_clean"
+    
+    dsets=()
+    x=0
+    for i in $(echo $DN_DIRS | sed "s/,/ /g")
+    do
+	name=$(basename -- "$i")
+	dsets+=( "${POOLS[$x]}/${name}" )  
+	((x++))
+    done
+    
+    dsets_len="${#dsets[@]}"
+
+    # sanity check
+    if [ "$dn_len" != "$dsets_len" ] ; then
+	echo "Error. The number of zfs/pools attributes should be the same as the number of hops/dn/data_dirs attributes"
+	exit 11
+    fi
+
+    x=0
+    for i in "${dsets[@]}"
+    do
+	EXISTS=0
+
+	
+	# cleanup the hopsfs datanode data_dir path
+        D=${DIRS[$x]}
+	dn_dir="${D/file:\/\//}"   # strip of any leading 'file://'
+        dn_dir=$(trim $dn_dir)	 # trim off trailing and leading spaces
+        echo "ZFS mount and unlock dataset : $i "
+	# Check if the dataset already exists
+        zfs list $i
+        if [ $? -eq 0 ] ; then
+	    echo "Error. The ZFS dataset already exists: $i. The dataset should not exist - it will be created during installation in the supplied zfs pool."
+            exit 19
+	else # create the zfs dataset 
+	    echo "key file is ${KEY_FILE}" 
+            sudo zfs create -o encryption=aes-128-gcm -o keyformat=passphrase -o keylocation=file://${KEY_FILE} -o mountpoint=$dn_dir $i
+	    if [ $? -ne 0 ] ; then
+	        echo "Could not create dataset: $i on mountpoint $dn_dir"
+                zpool list | grep ${POOLS[$x]}
+		if [ $? -ne 0 ] ; then
+		    echo "It appears the zpool does not exist: $${POOLS[$x]}"
+		    echo "You need to create the zpool first, the re-run Karamel and put the zfs/zpool attribute in your cluster definition file"
+		    exit 15
+		fi
+		exit 12
+            fi
+    
+	fi
+	((x++))   
+    done
+    
+}
+
+function _load {
+    for i in $(echo $DATASETS | sed "s/,/ /g")
+    do	 
+	zfs load-key -a -r -L keylocation=file:///${KEY_FILE} $i
+	if [ $? -ne 0 ] ; then
+	    echo "Could not load key for dataset: $i"
+	    exit 8
+	fi
+    done
+}
+
+
+function _mount {
+    _load
+    
+    for i in $(echo $DATASETS | sed "s/,/ /g")
+    do
+	sudo zfs mount $i
+	if [ $? -ne 0 ] ; then
+	    echo "Could mount dataset: $i"
+	    exit 5
+	fi
+    done
+}
+
+function _changekey {
+    res=0
+    err=1
+    if [ ! -e ${KEY_FILE} ] ; then
+        echo "File containing new key for ZFS key rotation does not exist."
+	exit 66
+    fi
+
+    while IFS= read -r newkey; do
+	echo "Read new key"
+    done < "${KEY_FILE}"
+
+    len=${#newkey}
+    if [ len -ne 8 ] ; then
+	echo "Invalid new key in $KEY_FILE . It should be 8 characters long."
+	exit 88
+    fi
+    
+    
+    for i in $(echo $DATASETS | sed "s/,/ /g")
+    do	 
+	zfs change-key -l -o keyformat=passphrase -o keylocation=file:///${KEY_FILE} $i
+	if [ $? -ne 0 ] ; then
+	    echo "Error when rotating key for ZFS dataset : $i"
+            res=$err
+	fi
+	((err++))	
+    done
+    return $res
+}
+
+function _status {
+    x=0
+    for i in $(echo $DATASETS | sed "s/,/ /g")
+    do
+        zfs list $i
+        if [ $? -eq 0 ] ; then
+            keystatus=$(zfs get keystatus $i | tail -1 | awk '{ print $3 }')
+            if [ "$keystatus" != "available" ] ; then
+		zfs load-key -a -r -L keylocation=file:///${KEY_FILE} $i
+		if [ $? -ne 0 ] ; then
+		    echo "Could not load key for dataset: $i"
+		    exit 14
+		fi
+	    fi
+
+            mounted=$(zfs get mounted $i | tail -1 | awk '{ print $3 }')
+            if [ "$mounted" == "no" ] ; then  
+		sudo zfs mount $i
+		if [ $? -ne 0 ] ; then
+		    exit 6
+		fi
+	    fi
+	else
+            echo "Dataset $i does not exist when you called 'status' on it."
+            exit 17
+	fi
+	((x++))   
+    done
+    echo "Status: all datasets seem ok and loaded"
+}
+
+
+
+if [ "$1" == "create" ] ; then
+    if [ $# -ne 2 ]
+    then
+	_help
+	exit 2
+    fi
+    ZPOOLS=$2
+    _create
+
+elif [ "$1" == "mount" ] ; then
+    _load
+    _mount
+
+elif [ "$1" == "status" ] ; then   # returns one of:  empty, created, loaded
+    _status
+    if [ "$RES" == "empty" ] || [ "$RES" == "created" ] || [ "$RES" == "loaded" ] ; then
+	exit 0
+    else
+	exit 17
+    fi
+elif [ "$1" == "rotate" ] ; then    
+    RET=_changekey
+    exit $RET
+else
+    echo "Invalid command: $1 . Valid commands are: create, status, changekey"
+    echo ""
+    exit 4
+fi    
+
+
+exit 0

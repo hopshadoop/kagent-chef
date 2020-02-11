@@ -282,6 +282,29 @@ blacklisted_envs = node['kagent']['python_conda_versions'].split(",").map(&:stri
 # hops-system anaconda env
 blacklisted_envs += ",hops-system,airflow"
 
+hopsfs_datadirs=node['install']['dir'] + "/hopsdata"
+if node.attribute?("hops") && node["hops"].attribute?("dn") && node["hops"]["dn"].attribute?("data_dir")
+  hopsfs_datadirs=node['hops']['dn']['data_dir']
+  dataDir=hopsfs_datadirs.gsub("file://","")
+  dirs = dataDir.split(",")
+  hdfsUser = "hdfs"
+  if node.attribute?("hops") && node["hops"].attribute?("hdfs") && node["hops"]["hdfs"].attribute?("user")
+    hdfsUser = node['hops']['hdfs']['user']
+  end
+  hopsGroup  = "hadoop"
+  if node.attribute?("hops") && node["hops"].attribute?("group")
+    hopsGroup = node['hops']['group']
+  end
+  
+  for d in dirs do
+    directory d do
+      owner hdfsUser
+      group hopsGroup
+      mode "0770"
+      action :create
+    end
+  end
+end
 # environment used by Hopsworks Cloud
 unless node['install']['cloud'].strip.empty?
   blacklisted_envs += ",cloud"

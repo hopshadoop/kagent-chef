@@ -136,7 +136,7 @@ class Heartbeat():
     daemon_threads = True
     def __init__(self, commands_queue, system_commands_status, system_commands_status_mutex,
                  conda_commands_status, conda_commands_status_mutex, conda_report_interval,
-                 conda_envs_monitor_list, host_services):
+                 conda_envs_monitor_list, host_services, zfs_key):
         self._commands_queue = commands_queue
         self._system_commands_status = system_commands_status
         self._system_commands_status_mutex = system_commands_status_mutex
@@ -148,7 +148,8 @@ class Heartbeat():
         self._last_conda_report = long(time.mktime(datetime.now().timetuple()) * 1000)
         self._host_services = host_services
         self._recover = True
-            
+        self._zfs_key = zfs_key
+        
         while True:
             self.send()
             time.sleep(kconfig.heartbeat_interval)
@@ -222,6 +223,7 @@ class Heartbeat():
                 payload["agent-time"] = now
                 payload["services"] = services_list
                 payload["recover"] = self._recover
+                payload["zfskey"] = self._zfs_key
                 
                 now_in_ms = now * 1000
                 time_to_report = (now_in_ms - self._last_conda_report) > self._conda_report_interval
@@ -295,6 +297,15 @@ class Heartbeat():
                     logger.debug("Response from heartbeat is: {0}".format(theResponse))
                     self._recover = False
                     try:
+                        if self._zfs_key == "request":
+                            self._zfs_key = theResponse['zfsKey']
+                            if zfs_key is not None:   # and len(zfs_key) == 10
+                                with open(zfs_passwd_file, 'w') as the_file:
+                                    the_file.write(zfs_key)
+                                zfs_mount()
+                            else:
+                                self._zfs_key = ""
+
                         system_commands = theResponse['system-commands']
                         for command in system_commands:
                             c = Command('SYSTEM_COMMAND', command)
@@ -471,6 +482,8 @@ class SystemCommandsHandler:
             self._service_key_rotation(command)
         elif op == 'CONDA_GC':
             self._conda_env_garbage_collection(command)
+        elif op == 'ZFS_KEY_ROTATION':
+            self._zfs_key_rotation(command)
         else:
             logger.error("Unknown OP {0} for system command {1}".format(op, command))
 
@@ -513,6 +526,28 @@ class SystemCommandsHandler:
         self._system_commands_status[command['id']] = command
         self._system_commands_status_mutex.release()
 
+    def _zfs_key_rotation(self, command):
+        try:
+            logger.debug("Calling zfs key rotation script")
+            passwd = command['execUser']
+            with open(kconfig.zfs_key_file, 'w') as the_file:
+                the_file.write(passwd)
+
+            subprocess.check_call(["sudo", kconfig.zfs_script, "rotate"])
+            command['status'] = 'FINISHED'
+            logger.info("Successfully rotated the local zfs key")
+        except CalledProcessError as e:
+            logger.error("Error while calling zfs key rotatescript: {0}".format(e))
+            command['status'] = 'FAILED'
+        except Exception as e:
+            logger.error("General error while rotating zfs key {0}".format(e))
+            command['status'] = 'FAILED'
+
+        self._system_commands_status_mutex.acquire()
+        logger.debug("Adding status {0} for command ID {1} - {2}".format(command['status'], command['id'], command))
+        self._system_commands_status[command['id']] = command
+        self._system_commands_status_mutex.release()
+        
 
 class Command:
     def __init__(self, command_type, command):
@@ -825,6 +860,26 @@ def construct_ordered_services_list(k_config, hw_http_client):
     return host_services
 
 
+def zfs_mount():
+        try:
+            logger.debug("Calling zfs dataset mount script")
+            subprocess.check_call(["sudo", kconfig.zfs_script, "mount"])
+            logger.info("Successfully mounted the local zfs datasets")
+        except CalledProcessError as e:
+            logger.error("Error while calling zfs dataset mount: {0}".format(e))
+        except Exception as e:
+            logger.error("General error while mounting a zfs dataset {0}".format(e))
+
+def zfs_rotate():
+        try:
+            logger.debug("Calling zfs key rotate script")
+            subprocess.check_call(["sudo", kconfig.zfs_script, "rotate"])
+            logger.info("Successfully rotated the local zfs keys")
+        except CalledProcessError as e:
+            logger.error("Error while calling zfs key rotate: {0}".format(e))
+        except Exception as e:
+            logger.error("General error while rotating a zfs key {0}".format(e))
+            
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(description='Hops nodes administration agent')
@@ -835,7 +890,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     
     verbose = args.verbose
-
+    
     global kconfig
     kconfig = KConfig(args.config)
     kconfig.read_conf()
@@ -844,9 +899,15 @@ if __name__ == '__main__':
     setupLogging(kconfig)
     prepare_conda_commands_logger(kconfig)
     readServicesFile()
-        
-    hw_http_client = kagent_utils.Http(kconfig)
 
+    zfs_passwd_file = kconfig.zfs_key_file
+    if os.path.exists(zfs_passwd_file):
+        with open(zfs_passwd_file, 'r') as the_file:
+            zfs_key=the_file.readline() 
+            zfs_mount()
+            
+    hw_http_client = kagent_utils.Http(kconfig)
+    
     if args.services:
         ordered_host_services = construct_ordered_services_list(kconfig, hw_http_client)
         if args.services == 'start':
@@ -900,6 +961,9 @@ if __name__ == '__main__':
     conda_commands_status_mutex = Lock()
     conda_commands_handler = CondaCommandsHandler(conda_commands_status, conda_commands_status_mutex)
 
+    # On startup of kagent, request the zfs key from Hopsworks to mount any ZFS encrypted datasets
+    zfs_key = "request"
+    
     ## Start commands handler thread
     commands_handler = Handler(commands_queue, system_commands_handler, conda_commands_handler)
     commands_handler.setDaemon(True)
@@ -908,7 +972,7 @@ if __name__ == '__main__':
     ## Start heartbeat thread
     hb_thread = threading.Thread(target=Heartbeat, args=(commands_queue, system_commands_status, system_commands_status_mutex,
                                                          conda_commands_status, conda_commands_status_mutex, conda_report_interval,
-                                                         conda_envs_monitor_list, host_services))
+                                                         conda_envs_monitor_list, host_services, zfs_key))
     hb_thread.setDaemon(True)
     hb_thread.start()
 

@@ -18,6 +18,8 @@ import requests
 import json
 import time
 import subprocess
+import string
+import random
 
 from OpenSSL import crypto
 from os.path import join, exists
@@ -246,13 +248,13 @@ class Host:
                      'User-Agent': 'hops-csr'}
     json_headers = {'User-Agent': 'Agent', 'content-type': 'application/json'}
     
-    def __init__(self, conf, certificate, state_store):
+    def __init__(self, conf, certificate, state_store, zfs_passwd_file):
         self._LOG = logging.getLogger(__name__)
         self._LOG.debug("Creating new host")
         self._conf = conf
         self._certificate = certificate
         self._state_store = state_store
-
+        self._zfs_passwd_file = zfs_passwd_file
     def rotate_key(self, session):
         """Public method to perform key rotation"""
         self._sign_csr(session)
@@ -277,6 +279,11 @@ class Host:
         json_response = json.loads(response.content)
         self._extract_crypto_material(json_response)
 
+
+    def _random_string(self, stringLength=16):
+        """Generate a random string with the combination of lowercase and uppercase letters """
+        letters = string.ascii_letters
+        return ''.join(random.choice(letters) for i in range(stringLength))
         
     def register_host(self, session):
         """Public method to register a new host and sign its CSR"""
@@ -303,17 +310,53 @@ class Host:
         jwt = self._login(session)
         self.json_headers['Authorization'] = jwt
         response = session.delete(self._conf.ca_host_url, headers=self.json_headers, params=params)
+
+
+    def _zfs_create_dataset(self):
+        """Public method to create zfs dataset"""
+        if not self._conf.zfs_pools:
+            self._LOG.info("No ZFS pools found")               
+            return ""
+
+        try:
+            passwd=""            
+            if os.path.exists(self._zfs_passwd_file):
+                with open(self._zfs_passwd_file, 'r') as the_file:
+                    passwd=the_file.readline() #returns a string, not bytes
+                    if not passwd or len(passwd) != 10 :
+                        passwd=self._random_string()        
+            else:
+                passwd=self._random_string()
+
+            with open(self._zfs_passwd_file, 'w') as the_file:
+                the_file.write(passwd)
+            self._LOG.info("Trying to create ZFS datasets. Password is: {0}".format(passwd))
+            subprocess.check_call(["sudo", self._conf.zfs_script, "create", self._conf.zfs_pools])
+            return passwd
+        except Exception, e:
+            LOG.error("Error while creating zfs dataset: {0}".format(e))
+            sys.exit(13)
         
+            
     def _register_host_internal(self, session):
         self._login(session)
         payload = {}
         payload["password"] = self._conf.agent_password
         payload["host-id"] = self._conf.host_id
-        self._LOG.info("Registering with Hopsworks")
+        payload["zfskey"] = self._zfs_create_dataset()
+            
+        self._LOG.info("Registering with Hopsworks. ZFS password is: {0}".format(payload["zfskey"]))
+        
         response = session.post(self._conf.register_url, headers=self.json_headers, data=json.dumps(payload), verify=False)
 
         if (response.status_code != requests.codes.ok):
             raise Exception('Could not register: Unknown host id or internal error on the dashboard (Status code: {0} - {1}).'.format(response.status_code, response.text))
+
+        # json_response = json.loads(response.content)
+        # hadoopHome = json_response["hadoopHome"]
+        # self._conf.set_conf_value('agent', 'hadoop-home', hadoopHome)
+        # self._conf.dump_to_file()
+
 
     def _store_new_crypto_state(self):
         previous_crypto_version = self._state_store.get_crypto_material_state().get_version()
@@ -385,6 +428,8 @@ if __name__ == '__main__':
     LOG.info("Public IP: {0}".format(config.public_ip))
     LOG.info("Private IP: {0}".format(config.private_ip))
 
+    zfs_passwd_file = config.zfs_key_file
+
     LOG.info("Restoring state from state-store")
     state_store_factory = StateStoreFactory(config.state_store_location)
     state_store = state_store_factory.get_instance('file')
@@ -400,7 +445,7 @@ if __name__ == '__main__':
             
         cert.create_csr()
 
-        h = Host(config, cert, state_store)
+        h = Host(config, cert, state_store, zfs_passwd_file)
         with requests.Session() as session:
             try:
                 h.register_host(session)
@@ -413,7 +458,7 @@ if __name__ == '__main__':
         LOG.debug("Key rotation")
 
         cert.create_csr()
-        h = Host(config, cert, state_store)
+        h = Host(config, cert, state_store, zfs_passwd_file)
         with requests.Session() as session:
             try:
                 h.rotate_key(session)
@@ -427,7 +472,7 @@ if __name__ == '__main__':
         
         cert.create_csr()
         
-        h = Host(config, cert, state_store)
+        h = Host(config, cert, state_store, zfs_passwd_file)
         with requests.Session() as session:
             try:
                 h.generate_elkadmin_cert(session)

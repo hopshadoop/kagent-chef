@@ -84,6 +84,11 @@ class KConfig:
             self.public_ip = self._config.get('agent', 'public-ip')
             self.private_ip = self._config.get('agent', 'private-ip')
 
+
+            self.zfs_key_file = self._config.get('agent', 'zfs-key-file')
+            self.zfs_script = self._config.get('agent', 'zfs-script')            
+            self.zfs_pools = self._config.get('agent', 'zfs-pools')
+            
             if (self._config.has_option("agent", "hostname")):
                 self.hostname = self._config.get("agent", "hostname")
             else:

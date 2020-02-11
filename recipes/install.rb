@@ -209,3 +209,46 @@ cookbook_file "#{node["kagent"]["certs_dir"]}/csr.py" do
   group node["kagent"]["certs_group"]
   mode 0710
 end
+
+hopsfs_datadirs=node['install']['dir'] + "/hopsdata/hdfs/dn"
+if node.attribute?("hops") && node["hops"].attribute?("dn") && node["hops"]["dn"].attribute?("data_dir")
+  hopsfs_datadirs=node['hops']['dn']['data_dir']
+end
+
+template  "#{node['kagent']['home']}/bin/zfs-commands.sh" do
+  source "zfs-commands.sh.erb"
+  owner "root"
+  group node["kagent"]["group"]
+  mode 0750
+  variables({
+              :hopsfs_datadirs => hopsfs_datadirs
+           })
+end
+
+
+pools = node["zfs"]["pools"].split(",")
+for pool in pools do 
+  bash "zfs_give_kagent_permissions" do
+    user "root"
+    code <<-EOF
+      zpool set delegation=on #{pool}
+      zfs allow #{node["kagent"]["user"]}, mount,change-key,create,load-key,destroy #{pool}
+      zfs allow #{node["kagent"]["certs_user"]}, mount,change-key,create,load-key,destroy #{pool}
+    EOF
+  end
+end
+
+
+if node["zfs"]["pools"].empty? == false
+  template "/etc/sudoers.d/kagent" do
+    source "sudoers.erb"
+    owner "root"
+    group "root"
+    mode "0440"
+    variables({
+                :user => node["kagent"]["user"],
+                :zfs_commands => "#{node['kagent']['base_dir']}/bin/zfs-commands.sh"
+                 })
+    action :create
+  end
+end

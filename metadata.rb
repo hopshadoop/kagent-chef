@@ -121,3 +121,11 @@ attribute "jupyter/python",
 attribute "kagent/python_conda_versions",
           :description => "CSV of python versions to be used as base environments for Anaconda",
           :type => "string"
+
+attribute "zfs/pools",
+          :description => "Comma-separated list of ZFS Pools that will be used to create encrypted datasets to store Hopsfs blocks",
+          :type => "string"
+
+attribute "zfs/key_file",
+          :description => "Path to file containing zfs key file for encryption-at-rest. Default is an in-memory, temporary file with locked-down-permissions.",
+          :type => "string"
